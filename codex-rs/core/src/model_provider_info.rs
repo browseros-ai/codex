@@ -284,7 +284,7 @@ pub fn built_in_model_providers() -> HashMap<String, ModelProviderInfo> {
                 env_key: None,
                 env_key_instructions: None,
                 experimental_bearer_token: None,
-                wire_api: WireApi::Responses,
+                wire_api: WireApi::Chat,
                 query_params: None,
                 http_headers: Some(
                     [("version".to_string(), env!("CARGO_PKG_VERSION").to_string())]
