@@ -1,10 +1,15 @@
 # Release workflow for BrowserOS Codex binaries.
 # Builds all distributions without signing.
-# To release, run:
-# ```
-# git tag -a browseros-v0.1.0 -m "Release 0.1.0"
-# git push origin browseros-v0.1.0
-# ```
+#
+# Two triggers:
+# 1. Automatic (tag push):
+#    ```
+#    git tag -a browseros-v0.1.0 -m "Release 0.1.0"
+#    git push origin browseros-v0.1.0
+#    ```
+#
+# 2. Manual (any branch):
+#    Go to Actions → release-browseros → "Run workflow"
 
 name: release-browseros
 
@@ -12,43 +17,14 @@ on:
   push:
     tags:
       - "browseros-v*.*.*"
+  workflow_dispatch:
 
 concurrency:
   group: ${{ github.workflow }}
   cancel-in-progress: true
 
 jobs:
-  tag-check:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v5
-
-      - name: Validate tag matches Cargo.toml version
-        shell: bash
-        run: |
-          set -euo pipefail
-          echo "::group::Tag validation"
-
-          # 1. Must be a tag and match the regex
-          [[ "${GITHUB_REF_TYPE}" == "tag" ]] \
-            || { echo "❌  Not a tag push"; exit 1; }
-          [[ "${GITHUB_REF_NAME}" =~ ^browseros-v[0-9]+\.[0-9]+\.[0-9]+(-(alpha|beta)(\.[0-9]+)?)?$ ]] \
-            || { echo "❌  Tag '${GITHUB_REF_NAME}' doesn't match expected format"; exit 1; }
-
-          # 2. Extract versions
-          tag_ver="${GITHUB_REF_NAME#browseros-v}"
-          cargo_ver="$(grep -m1 '^version' codex-rs/Cargo.toml \
-                        | sed -E 's/version *= *"([^"]+)".*/\1/')"
-
-          # 3. Compare
-          [[ "${tag_ver}" == "${cargo_ver}" ]] \
-            || { echo "❌  Tag ${tag_ver} ≠ Cargo.toml ${cargo_ver}"; exit 1; }
-
-          echo "✅  Tag and Cargo.toml agree (${tag_ver})"
-          echo "::endgroup::"
-
   build:
-    needs: tag-check
     name: Build - ${{ matrix.runner }} - ${{ matrix.target }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
@@ -79,6 +55,33 @@ jobs:
 
     steps:
       - uses: actions/checkout@v5
+
+      - name: Validate tag matches Cargo.toml (for tag pushes only)
+        if: startsWith(github.ref, 'refs/tags/browseros-v')
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "::group::Tag validation"
+
+          # Extract versions
+          tag_ver="${GITHUB_REF_NAME#browseros-v}"
+          cargo_ver="$(grep -m1 '^version' Cargo.toml \
+                        | sed -E 's/version *= *"([^"]+)".*/\1/')"
+
+          # Validate format
+          if ! [[ "${tag_ver}" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-(alpha|beta)(\.[0-9]+)?)?$ ]]; then
+            echo "❌  Tag '${GITHUB_REF_NAME}' doesn't match expected format"
+            exit 1
+          fi
+
+          # Compare versions
+          if [[ "${tag_ver}" != "${cargo_ver}" ]]; then
+            echo "❌  Tag ${tag_ver} ≠ Cargo.toml ${cargo_ver}"
+            exit 1
+          fi
+
+          echo "✅  Tag and Cargo.toml agree (${tag_ver})"
+          echo "::endgroup::"
       - uses: dtolnay/rust-toolchain@1.90
         with:
           targets: ${{ matrix.target }}
@@ -169,16 +172,33 @@ jobs:
       - name: List artifacts
         run: ls -R dist/
 
-      - name: Define release name
-        id: release_name
+      - name: Define release info
+        id: release_info
+        shell: bash
         run: |
-          version="${GITHUB_REF_NAME#browseros-v}"
-          echo "name=${version}" >> $GITHUB_OUTPUT
+          if [[ "${{ github.ref_type }}" == "tag" ]]; then
+            # Tag-based release: extract version from tag
+            version="${GITHUB_REF_NAME#browseros-v}"
+            release_name="BrowserOS ${version}"
+            tag_name="${GITHUB_REF_NAME}"
+            is_prerelease=$([[ "${version}" == *"-"* ]] && echo "true" || echo "false")
+          else
+            # Manual release: use branch and commit
+            branch="${GITHUB_REF#refs/heads/}"
+            commit="${GITHUB_SHA:0:7}"
+            release_name="BrowserOS (${branch} - ${commit})"
+            tag_name="browseros-manual-${GITHUB_RUN_ID}"
+            is_prerelease="true"
+          fi
+
+          echo "name=${release_name}" >> $GITHUB_OUTPUT
+          echo "tag=${tag_name}" >> $GITHUB_OUTPUT
+          echo "prerelease=${is_prerelease}" >> $GITHUB_OUTPUT
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          name: BrowserOS ${{ steps.release_name.outputs.name }}
-          tag_name: ${{ github.ref_name }}
+          name: ${{ steps.release_info.outputs.name }}
+          tag_name: ${{ steps.release_info.outputs.tag }}
           files: dist/**
-          prerelease: ${{ contains(steps.release_name.outputs.name, '-') }}
+          prerelease: ${{ steps.release_info.outputs.prerelease }}
