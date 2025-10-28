@@ -1,0 +1,204 @@
+# Release workflow for BrowserOS Codex binaries.
+# Builds all distributions without signing.
+#
+# Two triggers:
+# 1. Automatic (tag push):
+#    ```
+#    git tag -a browseros-v0.1.0 -m "Release 0.1.0"
+#    git push origin browseros-v0.1.0
+#    ```
+#
+# 2. Manual (any branch):
+#    Go to Actions → release-browseros → "Run workflow"
+
+name: release-browseros
+
+on:
+  push:
+    tags:
+      - "browseros-v*.*.*"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build - ${{ matrix.runner }} - ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: codex-rs
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15-xlarge
+            target: aarch64-apple-darwin
+          - runner: macos-15-xlarge
+            target: x86_64-apple-darwin
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - runner: windows-latest
+            target: x86_64-pc-windows-msvc
+          - runner: windows-11-arm
+            target: aarch64-pc-windows-msvc
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Validate tag matches Cargo.toml (for tag pushes only)
+        if: startsWith(github.ref, 'refs/tags/browseros-v')
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "::group::Tag validation"
+
+          # Extract versions
+          tag_ver="${GITHUB_REF_NAME#browseros-v}"
+          cargo_ver="$(grep -m1 '^version' Cargo.toml \
+                        | sed -E 's/version *= *"([^"]+)".*/\1/')"
+
+          # Validate format
+          if ! [[ "${tag_ver}" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-(alpha|beta)(\.[0-9]+)?)?$ ]]; then
+            echo "❌  Tag '${GITHUB_REF_NAME}' doesn't match expected format"
+            exit 1
+          fi
+
+          # Compare versions
+          if [[ "${tag_ver}" != "${cargo_ver}" ]]; then
+            echo "❌  Tag ${tag_ver} ≠ Cargo.toml ${cargo_ver}"
+            exit 1
+          fi
+
+          echo "✅  Tag and Cargo.toml agree (${tag_ver})"
+          echo "::endgroup::"
+      - uses: dtolnay/rust-toolchain@1.90
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            ${{ github.workspace }}/codex-rs/target/
+          key: cargo-${{ matrix.runner }}-${{ matrix.target }}-release-${{ hashFiles('**/Cargo.lock') }}
+
+      - if: ${{ matrix.target == 'x86_64-unknown-linux-musl' || matrix.target == 'aarch64-unknown-linux-musl'}}
+        name: Install musl build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools pkg-config
+
+      - name: Cargo build
+        run: cargo build --target ${{ matrix.target }} --release --bin codex
+
+      - name: Stage artifacts
+        shell: bash
+        run: |
+          dest="dist/${{ matrix.target }}"
+          mkdir -p "$dest"
+
+          if [[ "${{ matrix.runner }}" == windows* ]]; then
+            cp target/${{ matrix.target }}/release/codex.exe "$dest/codex-${{ matrix.target }}.exe"
+          else
+            cp target/${{ matrix.target }}/release/codex "$dest/codex-${{ matrix.target }}"
+          fi
+
+      - if: ${{ matrix.runner == 'windows-11-arm' }}
+        name: Install zstd
+        shell: powershell
+        run: choco install -y zstandard
+
+      - name: Compress artifacts
+        shell: bash
+        run: |
+          dest="dist/${{ matrix.target }}"
+
+          # Create .tar.gz for all platforms and .zip for Windows
+          for f in "$dest"/*; do
+            base="$(basename "$f")"
+            # Skip files that are already archives
+            if [[ "$base" == *.tar.gz || "$base" == *.zip ]]; then
+              continue
+            fi
+
+            # Create per-binary tar.gz
+            tar -C "$dest" -czf "$dest/${base}.tar.gz" "$base"
+
+            # Create zip archive for Windows binaries
+            if [[ "${{ matrix.runner }}" == windows* ]]; then
+              (cd "$dest" && 7z a "${base}.zip" "$base")
+            fi
+
+            # Create .zst and remove the original binary
+            zstd -T0 -19 --rm "$dest/$base"
+          done
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: |
+            codex-rs/dist/${{ matrix.target }}/*
+
+  release:
+    needs: build
+    name: Create Release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: List artifacts
+        run: ls -R dist/
+
+      - name: Define release info
+        id: release_info
+        shell: bash
+        run: |
+          if [[ "${{ github.ref_type }}" == "tag" ]]; then
+            # Tag-based release: extract version from tag
+            version="${GITHUB_REF_NAME#browseros-v}"
+            release_name="BrowserOS ${version}"
+            tag_name="${GITHUB_REF_NAME}"
+            is_prerelease=$([[ "${version}" == *"-"* ]] && echo "true" || echo "false")
+          else
+            # Manual release: use branch and commit
+            branch="${GITHUB_REF#refs/heads/}"
+            commit="${GITHUB_SHA:0:7}"
+            release_name="BrowserOS (${branch} - ${commit})"
+            tag_name="browseros-manual-${GITHUB_RUN_ID}"
+            is_prerelease="true"
+          fi
+
+          echo "name=${release_name}" >> $GITHUB_OUTPUT
+          echo "tag=${tag_name}" >> $GITHUB_OUTPUT
+          echo "prerelease=${is_prerelease}" >> $GITHUB_OUTPUT
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ steps.release_info.outputs.name }}
+          tag_name: ${{ steps.release_info.outputs.tag }}
+          files: dist/**
+          prerelease: ${{ steps.release_info.outputs.prerelease }}
