@@ -1,0 +1,184 @@
+# Release workflow for BrowserOS Codex binaries.
+# Builds all distributions without signing.
+# To release, run:
+# ```
+# git tag -a browseros-v0.1.0 -m "Release 0.1.0"
+# git push origin browseros-v0.1.0
+# ```
+
+name: release-browseros
+
+on:
+  push:
+    tags:
+      - "browseros-v*.*.*"
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: true
+
+jobs:
+  tag-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Validate tag matches Cargo.toml version
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "::group::Tag validation"
+
+          # 1. Must be a tag and match the regex
+          [[ "${GITHUB_REF_TYPE}" == "tag" ]] \
+            || { echo "❌  Not a tag push"; exit 1; }
+          [[ "${GITHUB_REF_NAME}" =~ ^browseros-v[0-9]+\.[0-9]+\.[0-9]+(-(alpha|beta)(\.[0-9]+)?)?$ ]] \
+            || { echo "❌  Tag '${GITHUB_REF_NAME}' doesn't match expected format"; exit 1; }
+
+          # 2. Extract versions
+          tag_ver="${GITHUB_REF_NAME#browseros-v}"
+          cargo_ver="$(grep -m1 '^version' codex-rs/Cargo.toml \
+                        | sed -E 's/version *= *"([^"]+)".*/\1/')"
+
+          # 3. Compare
+          [[ "${tag_ver}" == "${cargo_ver}" ]] \
+            || { echo "❌  Tag ${tag_ver} ≠ Cargo.toml ${cargo_ver}"; exit 1; }
+
+          echo "✅  Tag and Cargo.toml agree (${tag_ver})"
+          echo "::endgroup::"
+
+  build:
+    needs: tag-check
+    name: Build - ${{ matrix.runner }} - ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: codex-rs
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15-xlarge
+            target: aarch64-apple-darwin
+          - runner: macos-15-xlarge
+            target: x86_64-apple-darwin
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - runner: windows-latest
+            target: x86_64-pc-windows-msvc
+          - runner: windows-11-arm
+            target: aarch64-pc-windows-msvc
+
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@1.90
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            ${{ github.workspace }}/codex-rs/target/
+          key: cargo-${{ matrix.runner }}-${{ matrix.target }}-release-${{ hashFiles('**/Cargo.lock') }}
+
+      - if: ${{ matrix.target == 'x86_64-unknown-linux-musl' || matrix.target == 'aarch64-unknown-linux-musl'}}
+        name: Install musl build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools pkg-config
+
+      - name: Cargo build
+        run: cargo build --target ${{ matrix.target }} --release --bin codex
+
+      - name: Stage artifacts
+        shell: bash
+        run: |
+          dest="dist/${{ matrix.target }}"
+          mkdir -p "$dest"
+
+          if [[ "${{ matrix.runner }}" == windows* ]]; then
+            cp target/${{ matrix.target }}/release/codex.exe "$dest/codex-${{ matrix.target }}.exe"
+          else
+            cp target/${{ matrix.target }}/release/codex "$dest/codex-${{ matrix.target }}"
+          fi
+
+      - if: ${{ matrix.runner == 'windows-11-arm' }}
+        name: Install zstd
+        shell: powershell
+        run: choco install -y zstandard
+
+      - name: Compress artifacts
+        shell: bash
+        run: |
+          dest="dist/${{ matrix.target }}"
+
+          # Create .tar.gz for all platforms and .zip for Windows
+          for f in "$dest"/*; do
+            base="$(basename "$f")"
+            # Skip files that are already archives
+            if [[ "$base" == *.tar.gz || "$base" == *.zip ]]; then
+              continue
+            fi
+
+            # Create per-binary tar.gz
+            tar -C "$dest" -czf "$dest/${base}.tar.gz" "$base"
+
+            # Create zip archive for Windows binaries
+            if [[ "${{ matrix.runner }}" == windows* ]]; then
+              (cd "$dest" && 7z a "${base}.zip" "$base")
+            fi
+
+            # Create .zst and remove the original binary
+            zstd -T0 -19 --rm "$dest/$base"
+          done
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: |
+            codex-rs/dist/${{ matrix.target }}/*
+
+  release:
+    needs: build
+    name: Create Release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: List artifacts
+        run: ls -R dist/
+
+      - name: Define release name
+        id: release_name
+        run: |
+          version="${GITHUB_REF_NAME#browseros-v}"
+          echo "name=${version}" >> $GITHUB_OUTPUT
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: BrowserOS ${{ steps.release_name.outputs.name }}
+          tag_name: ${{ github.ref_name }}
+          files: dist/**
+          prerelease: ${{ contains(steps.release_name.outputs.name, '-') }}
