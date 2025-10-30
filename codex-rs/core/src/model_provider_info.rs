@@ -13,6 +13,7 @@ use serde::Deserialize;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::env::VarError;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use crate::error::EnvVarError;
@@ -386,6 +387,9 @@ pub struct BrowserOSConfig {
     /// MCP servers to enable (same structure as config.toml mcp_servers).
     #[serde(default)]
     pub mcp_servers: Option<HashMap<String, toml::Value>>,
+    /// Path to a file containing base instructions (system prompt) for the LLM.
+    /// If relative, will be resolved relative to the BrowserOS config file's directory.
+    pub base_instructions_file: Option<PathBuf>,
 }
 
 /// Load BrowserOS provider configuration from a TOML file.

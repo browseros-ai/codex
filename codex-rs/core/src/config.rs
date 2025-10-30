@@ -1298,12 +1298,13 @@ impl Config {
         // Load BrowserOS provider if config file is specified.
         let mut browseros_model_name = None;
         let mut browseros_mcp_servers = HashMap::new();
+        let mut browseros_base_instructions_file = None;
         if let Some(browseros_config_path) = &browseros_config {
             use crate::model_provider_info::load_browseros_provider;
             use crate::model_provider_info::BUILT_IN_BROWSEROS_MODEL_PROVIDER_ID;
             use crate::model_provider_info::BrowserOSConfig;
 
-            // Load the full BrowserOS config to extract model_name and MCP servers
+            // Load the full BrowserOS config to extract model_name, MCP servers, and base_instructions_file
             let full_path = if browseros_config_path.is_relative() {
                 resolved_cwd.join(browseros_config_path)
             } else {
@@ -1327,6 +1328,20 @@ impl Config {
 
             // Extract model_name for later use
             browseros_model_name = browseros_cfg.model_name.clone();
+
+            // Extract base_instructions_file path for later use
+            // Resolve relative paths relative to the BrowserOS config file's directory
+            if let Some(instructions_path) = browseros_cfg.base_instructions_file {
+                let resolved_instructions_path = if instructions_path.is_relative() {
+                    full_path
+                        .parent()
+                        .unwrap_or(&resolved_cwd)
+                        .join(&instructions_path)
+                } else {
+                    instructions_path
+                };
+                browseros_base_instructions_file = Some(resolved_instructions_path);
+            }
 
             // Extract MCP servers from BrowserOS config
             if let Some(mcp_servers_value) = browseros_cfg.mcp_servers {
@@ -1426,16 +1441,22 @@ impl Config {
                 .and_then(|info| info.auto_compact_token_limit)
         });
 
-        // Load base instructions override from a file if specified. If the
-        // path is relative, resolve it against the effective cwd so the
-        // behaviour matches other path-like config values.
+        // Load base instructions override from a file if specified. Precedence:
+        // 1. CLI override (base_instructions from ConfigOverrides) - highest
+        // 2. BrowserOS config base_instructions_file
+        // 3. config.toml experimental_instructions_file
+        // 4. Model family default - lowest
         let experimental_instructions_path = config_profile
             .experimental_instructions_file
             .as_ref()
             .or(cfg.experimental_instructions_file.as_ref());
         let file_base_instructions =
             Self::get_base_instructions(experimental_instructions_path, &resolved_cwd)?;
-        let base_instructions = base_instructions.or(file_base_instructions);
+        let browseros_base_instructions =
+            Self::get_base_instructions(browseros_base_instructions_file.as_ref(), &resolved_cwd)?;
+        let base_instructions = base_instructions
+            .or(browseros_base_instructions)
+            .or(file_base_instructions);
 
         // Default review model when not set in config; allow CLI override to take precedence.
         let review_model = override_review_model
