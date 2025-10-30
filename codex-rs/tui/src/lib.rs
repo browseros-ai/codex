@@ -150,6 +150,7 @@ pub async fn run_main(
         tools_web_search_request: cli.web_search.then_some(true),
         experimental_sandbox_command_assessment: None,
         additional_writable_roots: additional_dirs,
+        browseros_config: cli.browseros_config.clone(),
     };
     let raw_overrides = cli.config_overrides.raw_overrides.clone();
     let overrides_cli = codex_common::CliConfigOverrides { raw_overrides };

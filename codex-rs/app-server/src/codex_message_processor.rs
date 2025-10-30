@@ -1675,6 +1675,7 @@ async fn derive_config_from_params(
         tools_web_search_request: None,
         experimental_sandbox_command_assessment: None,
         additional_writable_roots: Vec::new(),
+        browseros_config: None,
     };
 
     let cli_overrides = cli_overrides

@@ -1162,6 +1162,8 @@ pub struct ConfigOverrides {
     pub experimental_sandbox_command_assessment: Option<bool>,
     /// Additional directories that should be treated as writable roots for this session.
     pub additional_writable_roots: Vec<PathBuf>,
+    /// Path to BrowserOS provider config file (TOML).
+    pub browseros_config: Option<PathBuf>,
 }
 
 impl Config {
@@ -1191,6 +1193,7 @@ impl Config {
             tools_web_search_request: override_tools_web_search_request,
             experimental_sandbox_command_assessment: sandbox_command_assessment_override,
             additional_writable_roots,
+            browseros_config,
         } = overrides;
 
         let active_profile_name = config_profile_key
@@ -1292,10 +1295,85 @@ impl Config {
             model_providers.entry(key).or_insert(provider);
         }
 
-        let model_provider_id = model_provider
-            .or(config_profile.model_provider)
-            .or(cfg.model_provider)
-            .unwrap_or_else(|| "openai".to_string());
+        // Load BrowserOS provider if config file is specified.
+        let mut browseros_model_name = None;
+        let mut browseros_mcp_servers = HashMap::new();
+        let mut browseros_base_instructions_file = None;
+        if let Some(browseros_config_path) = &browseros_config {
+            use crate::model_provider_info::load_browseros_provider;
+            use crate::model_provider_info::BUILT_IN_BROWSEROS_MODEL_PROVIDER_ID;
+            use crate::model_provider_info::BrowserOSConfig;
+
+            // Load the full BrowserOS config to extract model_name, MCP servers, and base_instructions_file
+            let full_path = if browseros_config_path.is_relative() {
+                resolved_cwd.join(browseros_config_path)
+            } else {
+                browseros_config_path.clone()
+            };
+            let contents = std::fs::read_to_string(&full_path).map_err(|e| {
+                std::io::Error::new(
+                    e.kind(),
+                    format!("failed to read BrowserOS config file {}: {e}", full_path.display()),
+                )
+            })?;
+            let browseros_cfg: BrowserOSConfig = toml::from_str(&contents).map_err(|e| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "failed to parse BrowserOS config file {}: {e}",
+                        full_path.display()
+                    ),
+                )
+            })?;
+
+            // Extract model_name for later use
+            browseros_model_name = browseros_cfg.model_name.clone();
+
+            // Extract base_instructions_file path for later use
+            // Resolve relative paths relative to the BrowserOS config file's directory
+            if let Some(instructions_path) = browseros_cfg.base_instructions_file {
+                let resolved_instructions_path = if instructions_path.is_relative() {
+                    full_path
+                        .parent()
+                        .unwrap_or(&resolved_cwd)
+                        .join(&instructions_path)
+                } else {
+                    instructions_path
+                };
+                browseros_base_instructions_file = Some(resolved_instructions_path);
+            }
+
+            // Extract MCP servers from BrowserOS config
+            if let Some(mcp_servers_value) = browseros_cfg.mcp_servers {
+                for (name, server_value) in mcp_servers_value {
+                    // Deserialize MCP server config from TOML value
+                    match toml::from_str::<McpServerConfig>(&toml::to_string(&server_value).unwrap_or_default()) {
+                        Ok(server_config) => {
+                            browseros_mcp_servers.insert(name, server_config);
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "Failed to parse MCP server '{name}' from BrowserOS config: {e}"
+                            );
+                        }
+                    }
+                }
+            }
+
+            // Load and register the BrowserOS provider
+            let browseros_provider = load_browseros_provider(browseros_config_path, &resolved_cwd)?;
+            model_providers.insert(BUILT_IN_BROWSEROS_MODEL_PROVIDER_ID.to_string(), browseros_provider);
+        }
+
+        // Determine model provider ID: BrowserOS override takes precedence if configured
+        let model_provider_id = if browseros_config.is_some() {
+            crate::model_provider_info::BUILT_IN_BROWSEROS_MODEL_PROVIDER_ID.to_string()
+        } else {
+            model_provider
+                .or(config_profile.model_provider)
+                .or(cfg.model_provider)
+                .unwrap_or_else(|| "openai".to_string())
+        };
         let model_provider = model_providers
             .get(&model_provider_id)
             .ok_or_else(|| {
@@ -1331,7 +1409,9 @@ impl Config {
 
         let forced_login_method = cfg.forced_login_method;
 
+        // Model resolution: BrowserOS config model_name takes precedence if provided
         let model = model
+            .or(browseros_model_name)
             .or(config_profile.model)
             .or(cfg.model)
             .unwrap_or_else(default_model);
@@ -1361,16 +1441,22 @@ impl Config {
                 .and_then(|info| info.auto_compact_token_limit)
         });
 
-        // Load base instructions override from a file if specified. If the
-        // path is relative, resolve it against the effective cwd so the
-        // behaviour matches other path-like config values.
+        // Load base instructions override from a file if specified. Precedence:
+        // 1. CLI override (base_instructions from ConfigOverrides) - highest
+        // 2. BrowserOS config base_instructions_file
+        // 3. config.toml experimental_instructions_file
+        // 4. Model family default - lowest
         let experimental_instructions_path = config_profile
             .experimental_instructions_file
             .as_ref()
             .or(cfg.experimental_instructions_file.as_ref());
         let file_base_instructions =
             Self::get_base_instructions(experimental_instructions_path, &resolved_cwd)?;
-        let base_instructions = base_instructions.or(file_base_instructions);
+        let browseros_base_instructions =
+            Self::get_base_instructions(browseros_base_instructions_file.as_ref(), &resolved_cwd)?;
+        let base_instructions = base_instructions
+            .or(browseros_base_instructions)
+            .or(file_base_instructions);
 
         // Default review model when not set in config; allow CLI override to take precedence.
         let review_model = override_review_model
@@ -1398,7 +1484,14 @@ impl Config {
             // The config.toml omits "_mode" because it's a config file. However, "_mode"
             // is important in code to differentiate the mode from the store implementation.
             cli_auth_credentials_store_mode: cfg.cli_auth_credentials_store.unwrap_or_default(),
-            mcp_servers: cfg.mcp_servers,
+            mcp_servers: {
+                // Merge MCP servers: BrowserOS config MCP servers take precedence over global config
+                let mut merged_mcp_servers = cfg.mcp_servers;
+                for (name, server_config) in browseros_mcp_servers {
+                    merged_mcp_servers.insert(name, server_config);
+                }
+                merged_mcp_servers
+            },
             // The config.toml omits "_mode" because it's a config file. However, "_mode"
             // is important in code to differentiate the mode from the store implementation.
             mcp_oauth_credentials_store_mode: cfg.mcp_oauth_credentials_store.unwrap_or_default(),

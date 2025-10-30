@@ -58,6 +58,7 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
         images,
         model: model_cli_arg,
         oss,
+        browseros_config,
         config_profile,
         full_auto,
         dangerously_bypass_approvals_and_sandbox,
@@ -149,6 +150,7 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
     // When using `--oss`, let the bootstrapper pick the model (defaulting to
     // gpt-oss:20b) and ensure it is present locally. Also, force the built‑in
     // `oss` model provider.
+    // When using `--browseros`, BrowserOS config takes precedence over model and model_provider.
     let model = if let Some(model) = model_cli_arg {
         Some(model)
     } else if oss {
@@ -157,7 +159,9 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
         None // No model specified, will use the default.
     };
 
-    let model_provider = if oss {
+    let model_provider = if browseros_config.is_some() {
+        Some(codex_core::BUILT_IN_BROWSEROS_MODEL_PROVIDER_ID.to_string())
+    } else if oss {
         Some(BUILT_IN_OSS_MODEL_PROVIDER_ID.to_string())
     } else {
         None // No specific model provider override.
@@ -181,6 +185,7 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
         tools_web_search_request: None,
         experimental_sandbox_command_assessment: None,
         additional_writable_roots: Vec::new(),
+        browseros_config,
     };
     // Parse `-c` overrides.
     let cli_kv_overrides = match config_overrides.parse_overrides() {

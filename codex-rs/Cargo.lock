@@ -1226,7 +1226,7 @@ dependencies = [
 
 [[package]]
 name = "codex-keyring-store"
-version = "0.0.0"
+version = "0.49.0"
 dependencies = [
  "keyring",
  "tracing",
@@ -1495,7 +1495,7 @@ dependencies = [
 
 [[package]]
 name = "codex-utils-cache"
-version = "0.0.0"
+version = "0.49.0"
 dependencies = [
  "lru",
  "sha1",
@@ -1504,7 +1504,7 @@ dependencies = [
 
 [[package]]
 name = "codex-utils-image"
-version = "0.0.0"
+version = "0.49.0"
 dependencies = [
  "base64",
  "codex-utils-cache",

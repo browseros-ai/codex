@@ -13,6 +13,7 @@ use serde::Deserialize;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::env::VarError;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use crate::error::EnvVarError;
@@ -261,6 +262,7 @@ impl ModelProviderInfo {
 const DEFAULT_OLLAMA_PORT: u32 = 11434;
 
 pub const BUILT_IN_OSS_MODEL_PROVIDER_ID: &str = "oss";
+pub const BUILT_IN_BROWSEROS_MODEL_PROVIDER_ID: &str = "browseros";
 
 /// Built-in default provider list.
 pub fn built_in_model_providers() -> HashMap<String, ModelProviderInfo> {
@@ -286,7 +288,7 @@ pub fn built_in_model_providers() -> HashMap<String, ModelProviderInfo> {
                 env_key: None,
                 env_key_instructions: None,
                 experimental_bearer_token: None,
-                wire_api: WireApi::Chat,
+                wire_api: WireApi::Responses,
                 query_params: None,
                 http_headers: Some(
                     [("version".to_string(), env!("CARGO_PKG_VERSION").to_string())]
@@ -355,6 +357,102 @@ pub fn create_oss_provider_with_base_url(base_url: &str) -> ModelProviderInfo {
         stream_idle_timeout_ms: None,
         requires_openai_auth: false,
     }
+}
+
+/// BrowserOS provider configuration loaded from a TOML file.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct BrowserOSConfig {
+    /// Model name to use (e.g., "gpt-4o", "o3").
+    pub model_name: Option<String>,
+    /// Base URL for the API. If not set, will try BROWSEROS_BASE_URL env var.
+    pub base_url: Option<String>,
+    /// Environment variable name that contains the API key.
+    /// If not set, will try BROWSEROS_API_KEY env var.
+    pub api_key_env: Option<String>,
+    /// Wire API protocol to use: "chat" or "responses".
+    #[serde(default)]
+    pub wire_api: WireApi,
+    /// Additional query parameters for the base URL.
+    pub query_params: Option<HashMap<String, String>>,
+    /// Additional HTTP headers (static values).
+    pub http_headers: Option<HashMap<String, String>>,
+    /// HTTP headers sourced from environment variables.
+    pub env_http_headers: Option<HashMap<String, String>>,
+    /// Maximum number of request retries.
+    pub request_max_retries: Option<u64>,
+    /// Maximum number of stream reconnection attempts.
+    pub stream_max_retries: Option<u64>,
+    /// Idle timeout for streaming responses (milliseconds).
+    pub stream_idle_timeout_ms: Option<u64>,
+    /// MCP servers to enable (same structure as config.toml mcp_servers).
+    #[serde(default)]
+    pub mcp_servers: Option<HashMap<String, toml::Value>>,
+    /// Path to a file containing base instructions (system prompt) for the LLM.
+    /// If relative, will be resolved relative to the BrowserOS config file's directory.
+    pub base_instructions_file: Option<PathBuf>,
+}
+
+/// Load BrowserOS provider configuration from a TOML file.
+pub fn load_browseros_provider(
+    config_path: &std::path::Path,
+    cwd: &std::path::Path,
+) -> std::io::Result<ModelProviderInfo> {
+    // Resolve relative paths against cwd
+    let full_path = if config_path.is_relative() {
+        cwd.join(config_path)
+    } else {
+        config_path.to_path_buf()
+    };
+
+    let contents = std::fs::read_to_string(&full_path).map_err(|e| {
+        std::io::Error::new(
+            e.kind(),
+            format!("failed to read BrowserOS config file {}: {e}", full_path.display()),
+        )
+    })?;
+
+    let browseros_cfg: BrowserOSConfig = toml::from_str(&contents).map_err(|e| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "failed to parse BrowserOS config file {}: {e}",
+                full_path.display()
+            ),
+        )
+    })?;
+
+    // Resolve base_url: use config value, then env var, then error
+    let base_url = browseros_cfg.base_url.or_else(|| {
+        std::env::var("BROWSEROS_BASE_URL")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+    }).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "BrowserOS config must specify base_url or set BROWSEROS_BASE_URL environment variable",
+        )
+    })?;
+
+    // Resolve API key env var name
+    let api_key_env = browseros_cfg
+        .api_key_env
+        .unwrap_or_else(|| "BROWSEROS_API_KEY".to_string());
+
+    Ok(ModelProviderInfo {
+        name: "BrowserOS".into(),
+        base_url: Some(base_url),
+        env_key: Some(api_key_env),
+        env_key_instructions: None,
+        experimental_bearer_token: None,
+        wire_api: browseros_cfg.wire_api,
+        query_params: browseros_cfg.query_params,
+        http_headers: browseros_cfg.http_headers,
+        env_http_headers: browseros_cfg.env_http_headers,
+        request_max_retries: browseros_cfg.request_max_retries,
+        stream_max_retries: browseros_cfg.stream_max_retries,
+        stream_idle_timeout_ms: browseros_cfg.stream_idle_timeout_ms,
+        requires_openai_auth: false,
+    })
 }
 
 fn matches_azure_responses_base_url(base_url: &str) -> bool {
