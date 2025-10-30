@@ -11,7 +11,7 @@ use serde::ser::Serializer;
 use ts_rs::TS;
 
 use crate::user_input::UserInput;
-use codex_git_tooling::GhostCommit;
+use codex_git::GhostCommit;
 use codex_utils_image::error::ImageProcessingError;
 use schemars::JsonSchema;
 
@@ -49,6 +49,7 @@ pub enum ContentItem {
 pub enum ResponseItem {
     Message {
         #[serde(skip_serializing)]
+        #[ts(optional = nullable)]
         id: Option<String>,
         role: String,
         content: Vec<ContentItem>,
@@ -58,20 +59,25 @@ pub enum ResponseItem {
         id: String,
         summary: Vec<ReasoningItemReasoningSummary>,
         #[serde(default, skip_serializing_if = "should_serialize_reasoning_content")]
+        #[ts(optional = nullable)]
         content: Option<Vec<ReasoningItemContent>>,
+        #[ts(optional = nullable)]
         encrypted_content: Option<String>,
     },
     LocalShellCall {
         /// Set when using the chat completions API.
         #[serde(skip_serializing)]
+        #[ts(optional = nullable)]
         id: Option<String>,
         /// Set when using the Responses API.
+        #[ts(optional = nullable)]
         call_id: Option<String>,
         status: LocalShellStatus,
         action: LocalShellAction,
     },
     FunctionCall {
         #[serde(skip_serializing)]
+        #[ts(optional = nullable)]
         id: Option<String>,
         name: String,
         // The Responses API returns the function call arguments as a *string* that contains
@@ -92,8 +98,10 @@ pub enum ResponseItem {
     },
     CustomToolCall {
         #[serde(skip_serializing)]
+        #[ts(optional = nullable)]
         id: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional = nullable)]
         status: Option<String>,
 
         call_id: String,
@@ -114,8 +122,10 @@ pub enum ResponseItem {
     // }
     WebSearchCall {
         #[serde(skip_serializing)]
+        #[ts(optional = nullable)]
         id: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional = nullable)]
         status: Option<String>,
         action: WebSearchAction,
     },
@@ -193,6 +203,7 @@ pub enum LocalShellAction {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, JsonSchema, TS)]
+#[ts(optional_fields = nullable)]
 pub struct LocalShellExecAction {
     pub command: Vec<String>,
     pub timeout_ms: Option<u64>,
@@ -244,10 +255,20 @@ impl From<Vec<UserInput>> for ResponseInputItem {
                             } else {
                                 match std::fs::read(&path) {
                                     Ok(bytes) => {
-                                        let mime = mime_guess::from_path(&path)
-                                            .first()
-                                            .map(|m| m.essence_str().to_owned())
-                                            .unwrap_or_else(|| "image".to_string());
+                                        let Some(mime_guess) = mime_guess::from_path(&path).first()
+                                        else {
+                                            return local_image_error_placeholder(
+                                                &path,
+                                                "unsupported MIME type (unknown)",
+                                            );
+                                        };
+                                        let mime = mime_guess.essence_str().to_owned();
+                                        if !mime.starts_with("image/") {
+                                            return local_image_error_placeholder(
+                                                &path,
+                                                format!("unsupported MIME type `{mime}`"),
+                                            );
+                                        }
                                         let encoded =
                                             base64::engine::general_purpose::STANDARD.encode(bytes);
                                         ContentItem::InputImage {
@@ -275,6 +296,7 @@ impl From<Vec<UserInput>> for ResponseInputItem {
 /// If the `name` of a `ResponseItem::FunctionCall` is either `container.exec`
 /// or shell`, the `arguments` field should deserialize to this struct.
 #[derive(Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[ts(optional_fields = nullable)]
 pub struct ShellToolCallParams {
     pub command: Vec<String>,
     pub workdir: Option<String>,
@@ -307,6 +329,7 @@ pub enum FunctionCallOutputContentItem {
 /// `content_items` with the structured form that the Responses/Chat
 /// Completions APIs understand.
 #[derive(Debug, Default, Clone, PartialEq, JsonSchema, TS)]
+#[ts(optional_fields = nullable)]
 pub struct FunctionCallOutputPayload {
     pub content: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -625,6 +648,39 @@ mod tests {
                         assert!(
                             text.contains("could not read"),
                             "placeholder should mention read issue: {text}"
+                        );
+                    }
+                    other => panic!("expected placeholder text but found {other:?}"),
+                }
+            }
+            other => panic!("expected message response but got {other:?}"),
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn local_image_non_image_adds_placeholder() -> Result<()> {
+        let dir = tempdir()?;
+        let json_path = dir.path().join("example.json");
+        std::fs::write(&json_path, br#"{"hello":"world"}"#)?;
+
+        let item = ResponseInputItem::from(vec![UserInput::LocalImage {
+            path: json_path.clone(),
+        }]);
+
+        match item {
+            ResponseInputItem::Message { content, .. } => {
+                assert_eq!(content.len(), 1);
+                match &content[0] {
+                    ContentItem::InputText { text } => {
+                        assert!(
+                            text.contains("unsupported MIME type `application/json`"),
+                            "placeholder should mention unsupported MIME: {text}"
+                        );
+                        assert!(
+                            text.contains(&json_path.display().to_string()),
+                            "placeholder should mention path: {text}"
                         );
                     }
                     other => panic!("expected placeholder text but found {other:?}"),
