@@ -42,6 +42,7 @@ pub mod token_data;
 mod truncate;
 mod unified_exec;
 mod user_instructions;
+pub use model_provider_info::BUILT_IN_BROWSEROS_MODEL_PROVIDER_ID;
 pub use model_provider_info::BUILT_IN_OSS_MODEL_PROVIDER_ID;
 pub use model_provider_info::ModelProviderInfo;
 pub use model_provider_info::WireApi;

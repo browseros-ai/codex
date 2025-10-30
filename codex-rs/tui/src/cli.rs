@@ -38,6 +38,12 @@ pub struct Cli {
     #[arg(long = "oss", default_value_t = false)]
     pub oss: bool,
 
+    /// Select the BrowserOS model provider using a config file.
+    /// Loads provider configuration (base_url, api_key, model_name, MCP servers, etc.)
+    /// from the specified TOML file. Similar to --oss but uses a custom config file.
+    #[arg(long = "browseros", value_name = "CONFIG_FILE", value_hint = clap::ValueHint::FilePath)]
+    pub browseros_config: Option<PathBuf>,
+
     /// Configuration profile from config.toml to specify default options.
     #[arg(long = "profile", short = 'p')]
     pub config_profile: Option<String>,
