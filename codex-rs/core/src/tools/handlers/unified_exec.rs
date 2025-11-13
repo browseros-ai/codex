@@ -1,9 +1,7 @@
 use std::path::PathBuf;
 
-use async_trait::async_trait;
-use serde::Deserialize;
-
 use crate::function_tool::FunctionCallError;
+use crate::is_safe_command::is_known_safe_command;
 use crate::protocol::EventMsg;
 use crate::protocol::ExecCommandOutputDeltaEvent;
 use crate::protocol::ExecOutputStream;
@@ -20,6 +18,8 @@ use crate::unified_exec::UnifiedExecContext;
 use crate::unified_exec::UnifiedExecResponse;
 use crate::unified_exec::UnifiedExecSessionManager;
 use crate::unified_exec::WriteStdinRequest;
+use async_trait::async_trait;
+use serde::Deserialize;
 
 pub struct UnifiedExecHandler;
 
@@ -36,6 +36,10 @@ struct ExecCommandArgs {
     yield_time_ms: Option<u64>,
     #[serde(default)]
     max_output_tokens: Option<usize>,
+    #[serde(default)]
+    with_escalated_permissions: Option<bool>,
+    #[serde(default)]
+    justification: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -70,6 +74,19 @@ impl ToolHandler for UnifiedExecHandler {
         )
     }
 
+    fn is_mutating(&self, invocation: &ToolInvocation) -> bool {
+        let (ToolPayload::Function { arguments } | ToolPayload::UnifiedExec { arguments }) =
+            &invocation.payload
+        else {
+            return true;
+        };
+
+        let Ok(params) = serde_json::from_str::<ExecCommandArgs>(arguments) else {
+            return true;
+        };
+        !is_known_safe_command(&["bash".to_string(), "-lc".to_string(), params.cmd])
+    }
+
     async fn handle(&self, invocation: ToolInvocation) -> Result<ToolOutput, FunctionCallError> {
         let ToolInvocation {
             session,
@@ -100,8 +117,30 @@ impl ToolHandler for UnifiedExecHandler {
                         "failed to parse exec_command arguments: {err:?}"
                     ))
                 })?;
-                let workdir = args
-                    .workdir
+                let ExecCommandArgs {
+                    cmd,
+                    workdir,
+                    shell,
+                    login,
+                    yield_time_ms,
+                    max_output_tokens,
+                    with_escalated_permissions,
+                    justification,
+                } = args;
+
+                if with_escalated_permissions.unwrap_or(false)
+                    && !matches!(
+                        context.turn.approval_policy,
+                        codex_protocol::protocol::AskForApproval::OnRequest
+                    )
+                {
+                    return Err(FunctionCallError::RespondToModel(format!(
+                        "approval policy is {policy:?}; reject command — you cannot ask for escalated permissions if the approval policy is {policy:?}",
+                        policy = context.turn.approval_policy
+                    )));
+                }
+
+                let workdir = workdir
                     .as_deref()
                     .filter(|value| !value.is_empty())
                     .map(PathBuf::from);
@@ -113,18 +152,20 @@ impl ToolHandler for UnifiedExecHandler {
                     &context.call_id,
                     None,
                 );
-                let emitter = ToolEmitter::unified_exec(args.cmd.clone(), cwd.clone(), true);
+                let emitter = ToolEmitter::unified_exec(cmd.clone(), cwd.clone(), true);
                 emitter.emit(event_ctx, ToolEventStage::Begin).await;
 
                 manager
                     .exec_command(
                         ExecCommandRequest {
-                            command: &args.cmd,
-                            shell: &args.shell,
-                            login: args.login,
-                            yield_time_ms: args.yield_time_ms,
-                            max_output_tokens: args.max_output_tokens,
+                            command: &cmd,
+                            shell: &shell,
+                            login,
+                            yield_time_ms,
+                            max_output_tokens,
                             workdir,
+                            with_escalated_permissions,
+                            justification,
                         },
                         &context,
                     )
